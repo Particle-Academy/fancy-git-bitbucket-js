@@ -1,6 +1,6 @@
 {
   "name": "@particle-academy/fancy-git-bitbucket",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Bitbucket Cloud adapter for @particle-academy/fancy-git.",
   "license": "MIT",
   "type": "module",
