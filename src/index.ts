@@ -1,3 +1,5 @@
+import { GitError } from "@particle-academy/fancy-git";
+import type { GitErrorCode } from "@particle-academy/fancy-git";
 import type { CheckSummary, Comparison, CreateReviewInput, GitProvider, GitRemote, HostedRepository, Page, ProviderRepositoryRef, Review, ReviewDetails, ReviewQuery } from "@particle-academy/fancy-git";
 
 export interface BitbucketProviderOptions {
@@ -6,12 +8,49 @@ export interface BitbucketProviderOptions {
   baseUrl?: string;
 }
 
+/** Trailing slashes stripped by scanning: `replace(/\/+$/, "")` is quadratic on a long run of slashes not at the end. */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47 /* "/" */) end--;
+  return value.slice(0, end);
+}
+
+/** The fancy-git contract code for a Bitbucket HTTP status, the same table every adapter uses. */
+function errorCodeFor(status: number): GitErrorCode {
+  if (status === 401 || status === 403) return "auth";
+  if (status === 404) return "not_found";
+  if (status === 405) return "unsupported";
+  if (status === 409) return "conflict";
+  if (status === 400 || status === 422) return "invalid_argument";
+  if (status === 429) return "rate_limited";
+  return "unknown";
+}
+
+/** Bitbucket's error body (`{"type":"error","error":{"message":...}}`), bounded and single-line. */
+async function errorMessage(response: Response): Promise<string> {
+  let message = response.statusText || "no reason given";
+  try {
+    const content = JSON.parse(await response.text());
+    if (typeof content?.error?.message === "string") message = content.error.message;
+    else if (typeof content?.message === "string") message = content.message;
+  } catch {
+    // not JSON: keep the status text
+  }
+  const line = message.replace(/[\x00-\x1F\x7F]+/g, " ");
+  return line.length > 500 ? `${line.slice(0, 500)}...` : line;
+}
+
 export class BitbucketProvider implements GitProvider {
+  /** How many times a GET that answered 5xx is sent again. Never a POST. */
+  static readonly GET_RETRIES = 2;
+  /** The wait before retry n is n times this. */
+  static readonly RETRY_DELAY_MS = 100;
+
   readonly kind = "bitbucket" as const;
   private readonly baseUrl: string;
   private readonly fetcher: typeof globalThis.fetch;
   constructor(private readonly options: BitbucketProviderOptions = {}) {
-    this.baseUrl = (options.baseUrl ?? "https://api.bitbucket.org/2.0").replace(/\/$/, "");
+    this.baseUrl = trimTrailingSlashes(options.baseUrl ?? "https://api.bitbucket.org/2.0");
     this.fetcher = options.fetch ?? globalThis.fetch;
   }
 
@@ -57,10 +96,29 @@ export class BitbucketProvider implements GitProvider {
   private mapReview(item: any): Review {
     return { id: item.id.toString(), number: item.id, title: item.title, state: item.state === "MERGED" ? "merged" : item.state === "OPEN" ? "open" : "closed", webUrl: item.links.html.href, sourceBranch: item.source.branch.name, targetBranch: item.destination.branch.name, author: item.author?.display_name ?? "unknown" };
   }
+  /**
+   * One request. A GET that answers 5xx is retried, at most GET_RETRIES times;
+   * a POST is never replayed, because Bitbucket may already hold what it
+   * created. Every failure is a `GitError` carrying the fancy-git code.
+   */
   private async request(path: string, init: RequestInit = {}) {
     const token = typeof this.options.token === "function" ? await this.options.token() : this.options.token;
-    const response = await this.fetcher(`${this.baseUrl}${path}`, { ...init, headers: { Accept: "application/json", "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...init.headers } });
-    if (!response.ok) throw new Error(`Bitbucket API request failed (${response.status}).`);
+    const method = (init.method ?? "GET").toUpperCase();
+    const what = `${method} ${path.split("?", 1)[0]}`;
+    let response: Response;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        response = await this.fetcher(`${this.baseUrl}${path}`, { ...init, headers: { Accept: "application/json", "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...init.headers } });
+      } catch (error) {
+        throw new GitError("unknown", `Bitbucket request ${what} could not be completed: ${(error as Error)?.message ?? String(error)}`);
+      }
+      if (method !== "GET" || response.status < 500 || response.status > 599 || attempt >= BitbucketProvider.GET_RETRIES) break;
+      await response.body?.cancel().catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, BitbucketProvider.RETRY_DELAY_MS * (attempt + 1)));
+    }
+    if (!response.ok) {
+      throw new GitError(errorCodeFor(response.status), `Bitbucket answered ${what} with ${response.status}: ${await errorMessage(response)}`, response.status);
+    }
     return response.json();
   }
 }

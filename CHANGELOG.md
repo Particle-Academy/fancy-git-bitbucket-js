@@ -30,6 +30,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Bitbucket's failures are `GitError`s with the fancy-git code.** They were
+  bare `Error("Bitbucket API request failed (401).")` with no code and no
+  Bitbucket message. Now 401/403 `auth`, 404 `not_found`, 400/422
+  `invalid_argument`, 405 `unsupported`, 409 `conflict`, 429 `rate_limited`,
+  otherwise `unknown`, with the HTTP status as `exitCode` and Bitbucket's own
+  message in the text. A network failure is `unknown`. Nothing to do unless you
+  matched on the old message text; `instanceof Error` still holds.
+- **A GET that answers 5xx is retried, at most twice** (100 ms then 200 ms
+  apart). A POST is never replayed, because Bitbucket may already hold what the
+  first attempt created.
+- **Every trailing slash is stripped from `baseUrl`, in linear time.** Only one
+  was, so `https://.../2.0//` built `2.0//repositories/...` and Bitbucket
+  answered 404. Found, with the two above, by the fancy-labs git-adapter test.
+
 - **`CHANGELOG.md` is now in the published tarball.** `files` did not whitelist it, so npm never shipped it — and this package puts breaking changes in MINOR releases and tells you in the README to read the entry before taking one. The instruction existed for the author, who has the file, and not for the consumer, who is the only one being instructed. Nothing for you to do; the file simply arrives from this release on.
 
 ### Security
